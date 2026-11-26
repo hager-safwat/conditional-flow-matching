@@ -2,224 +2,146 @@
 Conditional flow matching from scratch (2-D)
 ============================================
 
-A minimal, self-contained implementation of flow matching (Lipman et al.,
-2023) trained with the conditional flow-matching objective, plus label
-conditioning so we can steer *which* part of the distribution is generated.
-Runs on CPU in well under a minute.
-
-The task: the target is a two-moons distribution where each moon is a class
-(0 = upper, 1 = lower). After training, asking for class 0 generates only the
-upper moon and class 1 only the lower one -- so the model has learned a
-*controllable* generator, not just an unconditional one.
-
-How flow matching differs from diffusion
-----------------------------------------
-A diffusion model learns to *denoise* step by step. Flow matching instead
-learns a **velocity field** that continuously transports a simple base
-distribution (a Gaussian) into the data distribution along near-straight
-paths, and generates by integrating an ODE. It is often simpler and needs
-far fewer sampling steps.
-
-The two ideas
--------------
-1. Straight-line conditional paths. Pick a noise point x0 ~ N(0, I) and a
-   real point x1. Interpolate linearly between them:
-
-        x_t = (1 - t) * x0 + t * x1,      t in [0, 1]
-
-   Along this straight path the ideal velocity is *constant*:
-
-        u = x1 - x0
-
-2. Regress the velocity. Train a network v_theta(x_t, t, c) -- also given the
-   class label c -- to predict u. That single MSE objective is the whole of
-   conditional flow matching. To generate a sample of class c, start from
-   noise and integrate dx/dt = v_theta(x, t, c) from t = 0 to t = 1.
+Trains a label-conditioned velocity field with the conditional flow-matching
+objective (Lipman et al., 2023) on a two-moons distribution where each moon
+is a class, generates each class separately by integrating the learned ODE,
+checks that conditioning really controls which moon comes out, and draws the
+figure.
 
 All data is synthetic. This is a mechanism demo, not a benchmark.
+
+Usage
+-----
+    python cfm_demo.py                          # full run, writes figure.png
+    python cfm_demo.py --steps 300 --no-figure  # quick smoke run
 """
+
+import argparse
 
 import numpy as np
 import torch
-import torch.nn as nn
-import matplotlib.pyplot as plt
+
+from cfm import VelocityField, generate, make_two_moons_labelled, mean_nn_distance, train
 
 SEED = 0
-rng = np.random.default_rng(SEED)
-torch.manual_seed(SEED)
+N_POINTS = 4000
 
 
-# ---------------------------------------------------------------------------
-# 1. Target distribution, with a class label per point
-# ---------------------------------------------------------------------------
-# Two moons. Every point carries a label: 0 for the upper moon, 1 for the
-# lower one. That label is what we will condition the generator on.
-def make_two_moons_labelled(n, noise=0.06):
-    n1 = n // 2
-    n2 = n - n1
-    t1 = np.pi * rng.uniform(0, 1, n1)
-    t2 = np.pi * rng.uniform(0, 1, n2)
-    moon1 = np.stack([np.cos(t1), np.sin(t1)], axis=1)              # class 0
-    moon2 = np.stack([1 - np.cos(t2), 0.5 - np.sin(t2)], axis=1)    # class 1
-    x = np.concatenate([moon1, moon2], axis=0)
-    c = np.concatenate([np.zeros(n1), np.ones(n2)]).astype(np.int64)
-    x += rng.normal(0, noise, x.shape)
-    mean, std = x.mean(0), x.std(0)
-    x = (x - mean) / std                                           # standardise
-    return (torch.tensor(x, dtype=torch.float32),
-            torch.tensor(c, dtype=torch.long))
+def nearest_class(points, real0, real1, chunk=1000):
+    """For each point, return 0 if its nearest real point is in class 0, else 1."""
+    out = []
+    for start in range(0, len(points), chunk):
+        p = points[start:start + chunk]
+        d0 = np.sqrt(((p[:, None] - real0[None]) ** 2).sum(-1)).min(1)
+        d1 = np.sqrt(((p[:, None] - real1[None]) ** 2).sum(-1)).min(1)
+        out.append((d1 < d0).astype(int))
+    return np.concatenate(out)
 
 
-data_x, data_c = make_two_moons_labelled(4000)
+def run_experiment(steps=8000, seed=SEED, log_every=2000):
+    """Train, generate and evaluate. Returns (metrics, arrays for the figure).
+
+    Order matters for exact reproducibility: one numpy generator makes the
+    data, one torch seed controls initialisation, training and sampling.
+    """
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+
+    data_x, data_c = make_two_moons_labelled(N_POINTS, rng)
+    model = VelocityField()
+    losses = train(model, data_x, data_c, steps=steps, log_every=log_every)
+
+    gen0 = generate(model, 2000, cls=0).numpy()
+    gen1 = generate(model, 2000, cls=1).numpy()
+    _, traj = generate(model, 300, cls=0, record=True)
+
+    real0 = data_x[data_c == 0].numpy()
+    real1 = data_x[data_c == 1].numpy()
+
+    # Reference floor: a fresh draw of REAL data from a separate generator.
+    fresh_x, fresh_c = make_two_moons_labelled(N_POINTS, np.random.default_rng(seed + 1))
+    fresh0 = fresh_x[fresh_c == 0].numpy()
+
+    metrics = {
+        "loss_last_1000_mean": float(np.mean(losses[-1000:])),
+        "c0_to_moon0": mean_nn_distance(gen0, real0),
+        "c0_to_moon1": mean_nn_distance(gen0, real1),
+        "c1_to_moon1": mean_nn_distance(gen1, real1),
+        "c1_to_moon0": mean_nn_distance(gen1, real0),
+        "real_to_real_floor": mean_nn_distance(fresh0, real0),
+        "c0_correct_share": float((nearest_class(gen0, real0, real1) == 0).mean()),
+        "c1_correct_share": float((nearest_class(gen1, real0, real1) == 1).mean()),
+    }
+    arrays = {"real0": real0, "real1": real1, "gen0": gen0, "gen1": gen1,
+              "traj": torch.stack(traj).numpy()}
+    return metrics, arrays
 
 
-# ---------------------------------------------------------------------------
-# 2. The velocity network v_theta(x, t, c)
-# ---------------------------------------------------------------------------
-# Inputs: the current point x, the continuous time t in [0, 1] (lifted with a
-# sinusoidal embedding so the small MLP can use it smoothly), and the class
-# label c (looked up in a small embedding table). Output: a 2-D velocity.
-class SinusoidalTime(nn.Module):
-    def __init__(self, dim=64):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, t):
-        half = self.dim // 2
-        freqs = torch.exp(
-            -np.log(10000.0) * torch.arange(half, dtype=torch.float32) / (half - 1)
-        )
-        args = t[:, None] * freqs[None, :] * 100.0     # t in [0,1], scale up
-        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+def print_metrics(m):
+    print(f"\ntraining loss (mean of last 1000)          {m['loss_last_1000_mean']:.4f}")
+    print("\nConditioning check (mean nearest-neighbour distance, standardised units)")
+    print(f"  class-0 samples -> upper moon {m['c0_to_moon0']:.3f}   "
+          f"(vs lower moon {m['c0_to_moon1']:.3f})")
+    print(f"  class-1 samples -> lower moon {m['c1_to_moon1']:.3f}   "
+          f"(vs upper moon {m['c1_to_moon0']:.3f})")
+    print(f"  real -> real, fresh draw (floor)  {m['real_to_real_floor']:.3f}")
+    print("\nShare of samples whose nearest real point has the requested class")
+    print(f"  class 0: {100 * m['c0_correct_share']:.1f} %   "
+          f"class 1: {100 * m['c1_correct_share']:.1f} %")
 
 
-class VelocityField(nn.Module):
-    def __init__(self, n_classes=2, t_dim=64, c_dim=32, hidden=256):
-        super().__init__()
-        self.time_embed = SinusoidalTime(t_dim)
-        self.class_embed = nn.Embedding(n_classes, c_dim)
-        self.net = nn.Sequential(
-            nn.Linear(2 + t_dim + c_dim, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, 2),
-        )
+def save_figure(a, path="figure.png"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-    def forward(self, x, t, c):
-        h = torch.cat([x, self.time_embed(t), self.class_embed(c)], dim=-1)
-        return self.net(h)
+    fig, ax = plt.subplots(1, 3, figsize=(13.5, 4.6))
+    ax[0].scatter(*a["real0"].T, s=4, alpha=0.4, color="#1f4e79", label="class 0")
+    ax[0].scatter(*a["real1"].T, s=4, alpha=0.4, color="#b5651d", label="class 1")
+    ax[0].set_title("Target distribution\n(two moons, one class each)")
+    ax[0].legend(fontsize=8, markerscale=2, loc="upper right")
 
+    ax[1].scatter(*a["gen0"].T, s=4, alpha=0.4, color="#1f4e79", label="asked for class 0")
+    ax[1].scatter(*a["gen1"].T, s=4, alpha=0.4, color="#b5651d", label="asked for class 1")
+    ax[1].set_title("Conditional generation\n(each class requested separately)")
+    ax[1].legend(fontsize=8, markerscale=2, loc="upper right")
 
-model = VelocityField()
+    traj = a["traj"]                                    # (n_steps + 1, n_points, 2)
+    for k in range(0, traj.shape[1], 8):
+        ax[2].plot(traj[:, k, 0], traj[:, k, 1], color="#1f4e79", alpha=0.25, linewidth=0.7)
+    ax[2].scatter(*traj[0].T, s=6, color="grey", alpha=0.6, label="start (noise)")
+    ax[2].scatter(*traj[-1].T, s=6, color="#1f4e79", alpha=0.7, label="end (class 0)")
+    ax[2].set_title("Transport paths\n(noise flows to the requested class)")
+    ax[2].legend(fontsize=8, markerscale=2, loc="upper right")
 
+    for axis in ax:
+        axis.set_xlim(-2.5, 2.5)
+        axis.set_ylim(-2.5, 2.5)
+        axis.set_xticks([])
+        axis.set_yticks([])
+        axis.set_aspect("equal")
 
-# ---------------------------------------------------------------------------
-# 3. Training: the conditional flow-matching objective
-# ---------------------------------------------------------------------------
-# For each step: take real points (with their labels), pair each with a fresh
-# noise point, place them on the straight path at a random time t, and train
-# the network to output the constant path velocity (x1 - x0) for that label.
-opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-loss_fn = nn.MSELoss()
-batch_size = 512
-steps = 8000
-
-for step in range(steps):
-    idx = torch.randint(0, data_x.shape[0], (batch_size,))
-    x1 = data_x[idx]                       # real point
-    c = data_c[idx]                        # its class label
-    x0 = torch.randn_like(x1)              # a noise point
-    t = torch.rand(batch_size)             # random time in [0, 1]
-    x_t = (1 - t)[:, None] * x0 + t[:, None] * x1     # point on the path
-    target_velocity = x1 - x0              # constant along a straight path
-    pred = model(x_t, t, c)
-    loss = loss_fn(pred, target_velocity)
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
-    if (step + 1) % 2000 == 0:
-        print(f"step {step + 1:>5d}/{steps}   loss {loss.item():.4f}")
+    fig.suptitle("Conditional flow matching: a learned velocity field transports "
+                 "noise into whichever moon (class) is requested.", fontsize=10.5)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.savefig(path, dpi=130)
+    print(f"\nSaved {path}")
 
 
-# ---------------------------------------------------------------------------
-# 4. Sampling: integrate the ODE for a chosen class
-# ---------------------------------------------------------------------------
-# Start from Gaussian noise and step forward from t = 0 to t = 1 following the
-# learned velocity, always conditioned on the requested class label. Flow
-# matching needs only a handful of steps because the paths are near-straight;
-# we use 100 here for smooth trajectories.
-@torch.no_grad()
-def generate(n, cls, n_steps=100, record=False):
-    x = torch.randn(n, 2)
-    c = torch.full((n,), cls, dtype=torch.long)
-    dt = 1.0 / n_steps
-    traj = [x.clone()]
-    for i in range(n_steps):
-        t = torch.full((n,), i * dt)
-        x = x + model(x, t, c) * dt        # explicit Euler step
-        if record:
-            traj.append(x.clone())
-    return (x, traj) if record else x
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Train a 2-D conditional flow-matching model.")
+    parser.add_argument("--steps", type=int, default=8000, help="training steps")
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--no-figure", action="store_true", help="skip figure.png")
+    args = parser.parse_args(argv)
+
+    metrics, arrays = run_experiment(steps=args.steps, seed=args.seed,
+                                     log_every=max(1, args.steps // 4))
+    print_metrics(metrics)
+    if not args.no_figure:
+        save_figure(arrays)
+    return metrics
 
 
-gen0 = generate(2000, cls=0)               # should be the upper moon
-gen1 = generate(2000, cls=1)               # should be the lower moon
-_, traj = generate(300, cls=0, record=True)  # trajectories for the figure
-
-
-# ---------------------------------------------------------------------------
-# 5. Quantitative check
-# ---------------------------------------------------------------------------
-# Confirm conditioning worked: class-0 samples should sit close to the real
-# upper moon and far from the lower one, and vice versa.
-real0 = data_x[data_c == 0].numpy()
-real1 = data_x[data_c == 1].numpy()
-
-
-def mean_nn(a, b):
-    d = np.sqrt(((a[:, None, :] - b[None, :, :]) ** 2).sum(-1))
-    return d.min(axis=1).mean()
-
-
-g0 = gen0.numpy(); g1 = gen1.numpy()
-print("\nConditioning check (mean nearest-neighbour distance)")
-print(f"  class-0 samples -> real upper moon : {mean_nn(g0, real0):.3f}   "
-      f"(vs lower moon {mean_nn(g0, real1):.3f})")
-print(f"  class-1 samples -> real lower moon : {mean_nn(g1, real1):.3f}   "
-      f"(vs upper moon {mean_nn(g1, real0):.3f})")
-
-
-# ---------------------------------------------------------------------------
-# 6. Figure
-# ---------------------------------------------------------------------------
-fig, ax = plt.subplots(1, 3, figsize=(13.5, 4.6))
-
-ax[0].scatter(*real0.T, s=4, alpha=0.4, color="#1f4e79", label="class 0")
-ax[0].scatter(*real1.T, s=4, alpha=0.4, color="#b5651d", label="class 1")
-ax[0].set_title("Target distribution\n(two moons, one class each)")
-ax[0].legend(fontsize=8, markerscale=2, loc="upper right")
-
-ax[1].scatter(*g0.T, s=4, alpha=0.4, color="#1f4e79", label="asked for class 0")
-ax[1].scatter(*g1.T, s=4, alpha=0.4, color="#b5651d", label="asked for class 1")
-ax[1].set_title("Conditional generation\n(each class requested separately)")
-ax[1].legend(fontsize=8, markerscale=2, loc="upper right")
-
-# A few transport trajectories from noise (t=0) to data (t=1) for class 0.
-traj_arr = torch.stack(traj).numpy()        # (n_steps+1, n_points, 2)
-for k in range(0, traj_arr.shape[1], 8):
-    ax[2].plot(traj_arr[:, k, 0], traj_arr[:, k, 1],
-               color="#1f4e79", alpha=0.25, linewidth=0.7)
-ax[2].scatter(*traj_arr[0].T, s=6, color="grey", alpha=0.6, label="start (noise)")
-ax[2].scatter(*traj_arr[-1].T, s=6, color="#1f4e79", alpha=0.7, label="end (class 0)")
-ax[2].set_title("Transport paths\n(noise flows to the requested class)")
-ax[2].legend(fontsize=8, markerscale=2, loc="upper right")
-
-for a in ax:
-    a.set_xlim(-2.5, 2.5); a.set_ylim(-2.5, 2.5)
-    a.set_xticks([]); a.set_yticks([]); a.set_aspect("equal")
-
-fig.suptitle("Conditional flow matching: a learned velocity field transports "
-             "noise into whichever moon (class) is requested.", fontsize=10.5)
-fig.tight_layout(rect=[0, 0, 1, 0.93])
-fig.savefig("figure.png", dpi=130)
-print("\nSaved figure.png")
+if __name__ == "__main__":
+    main()

@@ -1,66 +1,111 @@
 # Conditional flow matching from scratch (2-D)
 
-A minimal, self-contained implementation of **flow matching** (Lipman et al.,
-2023), trained with the conditional flow-matching objective and **label
-conditioning** so you can steer *which* part of the distribution is
-generated. Runs on CPU in under a minute.
+[![tests](https://github.com/hager-safwat/conditional-flow-matching/actions/workflows/tests.yml/badge.svg)](https://github.com/hager-safwat/conditional-flow-matching/actions/workflows/tests.yml)
+![python](https://img.shields.io/badge/python-3.10%2B-blue)
+[![license: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+A minimal, tested implementation of **flow matching** (Lipman et al., 2023),
+trained with the conditional flow-matching objective and **label
+conditioning**, so you can steer *which* part of the distribution is
+generated.
 
 The target is a two-moons distribution where each moon is a class
-(0 = upper, 1 = lower). After training, asking for class 0 generates only the
-upper moon and class 1 only the lower one — a *controllable* generator.
+(0 = upper, 1 = lower). After training, asking for class 0 generates the upper
+moon and class 1 the lower one: a *controllable* generator.
 
 ![result](figure.png)
 
 ## How it differs from diffusion
 
-A diffusion model learns to **denoise** in many small steps. Flow matching
-instead learns a **velocity field** that transports a simple base
-distribution (a Gaussian) into the data along near-straight paths, and
-generates by integrating an ODE. It is often simpler and needs far fewer
-sampling steps.
+A diffusion model learns to **denoise** in many small stochastic steps. Flow
+matching instead learns a **velocity field** that transports a simple base
+distribution (a Gaussian) into the data, and generates by integrating an
+ordinary differential equation.
 
 ## The two ideas
 
 **Straight-line conditional paths.** Pick a noise point `x0 ~ N(0, I)` and a
-real point `x1`. Interpolate linearly:
+real point `x1`, and interpolate:
 
 ```
 x_t = (1 - t) * x0 + t * x1,      t in [0, 1]
 ```
 
-Along that straight path the ideal velocity is constant: `u = x1 - x0`.
+Along that path the velocity is constant: `dx_t/dt = x1 - x0`.
 
-**Regress the velocity.** Train a network `v_theta(x_t, t, c)` — also given
-the class label `c` — to predict `u`. That single MSE objective is the whole
-of conditional flow matching. To generate a sample of class `c`, start from
-noise and integrate `dx/dt = v_theta(x, t, c)` from `t = 0` to `t = 1`.
+**Regress the velocity.** Train `v_theta(x_t, t, c)`, also given the class
+label `c`, to predict `x1 - x0` with an MSE loss. To generate class `c`,
+start from noise and integrate `dx/dt = v_theta(x, t, c)` from `t = 0` to
+`t = 1` (here with 100 explicit Euler steps).
 
-## What the figure shows
+The training loss does not go to zero, and that is expected: many `(x0, x1)`
+pairs pass through the same `x_t`, so the best possible prediction is their
+average velocity and the remaining variance cannot be removed.
 
-- **Left:** the target — two moons, one class each.
-- **Middle:** conditional generation — class 0 and class 1 requested
-  separately, each producing the correct moon.
-- **Right:** the transport paths — noise at `t = 0` flowing along the learned
-  velocity field to the requested class at `t = 1`.
+## Setup and results
 
-Quantitatively, class-0 samples land ~0.02 from the real upper moon and ~0.81
-from the lower one (and vice versa) — so conditioning genuinely controls which
-mode is generated, rather than just reproducing the whole distribution.
+| | |
+|---|---|
+| Data | 4000 points, two moons (2000 per class), jitter 0.06, standardised |
+| Network | MLP, 3 hidden layers of 256, SiLU; 64-dim time embedding, 32-dim learned class embedding (157,506 parameters) |
+| Training | Adam, lr 1e-3, batch 512, 8,000 steps |
+| Sampling | 2000 points per class, 100 Euler steps |
+
+Conditioning check, seed 0 (mean nearest-neighbour distance, standardised
+units; the floor between two independent draws of real data is 0.016):
+
+| Requested | to the correct moon | to the other moon | samples nearest the correct class |
+|---|---|---|---|
+| class 0 | 0.021 | 0.811 | 99.9 % |
+| class 1 | 0.018 | 0.792 | 100.0 % |
+
+Samples land almost at the real-data floor for the requested class and far
+from the other one, so the label really controls which mode is generated.
 
 ## Run it
 
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/hager-safwat/conditional-flow-matching.git
+cd conditional-flow-matching
+pip install -e ".[demo]"
 python cfm_demo.py
 ```
 
-CPU-only, under a minute. It prints the loss, the conditioning check, and
-regenerates `figure.png`.
+The full run takes a few minutes on a laptop CPU (measured: about 6 minutes
+on a 2-core cloud machine). It prints the loss and the conditioning check and
+regenerates `figure.png`. Quick check: `python cfm_demo.py --steps 300 --no-figure`.
 
-## Scope and honesty
+## Tests
 
-This is a **mechanism demo on synthetic data** — the smallest complete
-conditional-flow-matching setup that still shows every moving part. It is not
+```bash
+pip install -e ".[dev]"
+pytest -v
+```
+
+| Test | What it verifies |
+|---|---|
+| `test_path_velocity_is_constant_and_equals_target` | finite differences of the path equal `x1 - x0` at several `t` |
+| `test_sampler_reaches_target_with_oracle_velocity` | with the exact velocity `(target - x) / (1 - t)`, the Euler sampler lands on the target, testing sampling independently of training |
+| `test_class_label_changes_the_prediction` | the class embedding actually changes the output |
+| plus data, embedding, training, metric and smoke tests | |
+
+Every push and pull request runs `ruff` and the tests on Python 3.10 and 3.12.
+
+## Repository structure
+
+```
+cfm/
+    data.py      labelled two-moons data
+    model.py     time embedding and velocity network
+    flow.py      probability path, training loop, ODE sampler, metric
+cfm_demo.py      experiment, conditioning check and figure
+tests/           pytest suite
+```
+
+## Scope
+
+This is a **mechanism demo on synthetic data**: the smallest complete
+conditional flow-matching setup that still shows every moving part. It is not
 a benchmark. The technique comes from my master's coursework, where I applied
 conditional flow matching to an image-based problem; this repository
 reimplements the core method from scratch on toy data, with no project data
@@ -73,4 +118,4 @@ involved.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
